@@ -1,88 +1,94 @@
-// Bring in the Express library (our web server tool)
+// 1. Read the .env file FIRST so process.env has our settings
+import "dotenv/config";
+
+// 2. Bring in the web server library
 import express from "express";
-// Bring in Pool from pg (a group of reusable database connections)
+
+// 3. Bring in the database connection pool tool
 import { Pool } from "pg";
 
-// Create the connection pool. The text means:
-// postgres://USERNAME:PASSWORD@HOST:PORT/DATABASE
+// 4. Read settings from .env
+//    "|| 3000" means: if PORT is missing, use 3000
+const PORT = Number(process.env.PORT) || 3000;
+
+//    If BASE_URL is missing, build one from the port
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+// 5. Create the database pool using the URL from .env
 const pool = new Pool({
-  connectionString: "postgres://app:app@localhost:5432/shortener",
+  connectionString: process.env.DATABASE_URL,
 });
 
-// Create our web server application
+// 6. Create the web server
 const app = express();
 
-// Middleware: converts incoming JSON text into a JavaScript object (req.body)
+// 7. Let the server understand JSON sent in requests
 app.use(express.json());
 
-// The 62 characters we use for short codes
+// 8. The 62 characters used in short codes
 const ALPHABET =
   "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-// Converts a normal number (like 1000001) into a short code (like "4c93")
+// 9. Convert a number into a short code
 function toBase62(n: number): string {
-  let result = "";               // we build the answer here
+  let result = "";
   do {
-    result = ALPHABET[n % 62] + result; // n % 62 = remainder, picks a character
-    n = Math.floor(n / 62);             // divide by 62, drop the decimal
-  } while (n > 0);               // keep going until the number reaches 0
+    result = ALPHABET[n % 62] + result;
+    n = Math.floor(n / 62);
+  } while (n > 0);
   return result;
 }
 
-// ROUTE 1: Health check. Must be ABOVE the /:code route (explained below)
+// ROUTE: home page (so "/" doesn't say "Cannot GET /")
+app.get("/", (_req, res) => {
+  res.send("URL Shortener API is running. Use POST /shorten to create a link.");
+});
+
+// ROUTE: health check
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// ROUTE 2: Create a short link. Runs when someone sends POST to /shorten
+// ROUTE: create a short link
 app.post("/shorten", async (req, res) => {
-  const { url } = req.body; // take "url" out of the request body
+  const { url } = req.body;
 
-  // Check the URL is valid. new URL() throws an error if it isn't.
   try {
     new URL(url);
   } catch {
-    // 400 = "bad request" (user's mistake)
     return res.status(400).json({ error: "Invalid URL" });
   }
 
-  // Save the long URL. $1 is a safe placeholder (prevents SQL injection).
-  // RETURNING id gives us back the id Postgres just created.
   const { rows } = await pool.query(
     "INSERT INTO urls (long_url) VALUES ($1) RETURNING id",
     [url]
   );
 
-  // Turn the id into a short code. +1000000 so codes aren't super tiny.
   const code = toBase62(Number(rows[0].id) + 1000000);
 
-  // Save the code in that same row
   await pool.query("UPDATE urls SET code = $1 WHERE id = $2", [
     code,
     rows[0].id,
   ]);
 
-  // Send the short link back to the user
-  res.json({ short: `http://localhost:3000/${code}` });
+  res.json({ short: `${BASE_URL}/${code}` });
 });
 
-// ROUTE 3: Use a short link. ":code" matches anything, like /4c93
+// ROUTE: open a short link (must stay LAST among the GET routes)
 app.get("/:code", async (req, res) => {
   const { rows } = await pool.query(
     "SELECT long_url FROM urls WHERE code = $1",
-    [req.params.code] // the value from the web address
+    [req.params.code]
   );
 
-  // No matching row = link doesn't exist. 404 = "not found"
   if (rows.length === 0) {
     return res.status(404).send("Not found");
   }
 
-  // 302 = temporary redirect: send the browser to the original URL
   res.redirect(302, rows[0].long_url);
 });
 
-// Start listening for requests on port 3000
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
-})
+// 10. Start the server
+app.listen(PORT, () => {
+  console.log(`Server running on ${BASE_URL}`);
+});
