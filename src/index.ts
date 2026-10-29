@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { Pool } from "pg";
+import Redis from "ioredis";
 
 const PORT = Number(process.env.PORT) || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -8,6 +9,19 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+
+// NEW: connect to Redis.
+// enableOfflineQueue:false = if Redis is down, fail fast instead of waiting forever
+const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+  enableOfflineQueue: false,
+  maxRetriesPerRequest: 1,
+});
+
+// NEW: without this, a Redis error could crash the whole server
+redis.on("error", (err) => console.error("Redis error:", err.message));
+
+// NEW: keep cached links for at most 1 hour
+const CACHE_TTL_SECONDS = 3600;
 
 const app = express();
 app.use(express.json());
@@ -24,11 +38,7 @@ function toBase62(n: number): string {
   return result;
 }
 
-// NEW: words users are not allowed to use as an alias,
-// because they are already real routes in our app
 const RESERVED = ["health", "shorten", "api", "admin"];
-
-// NEW: alias rules: 3 to 30 characters, only letters, digits, - and _
 const ALIAS_PATTERN = /^[a-zA-Z0-9_-]{3,30}$/;
 
 app.get("/", (_req, res) => {
@@ -43,7 +53,6 @@ app.post("/shorten", async (req, res) => {
   try {
     const { url, alias, expiresInMinutes } = req.body;
 
-    // 1. Validate the URL
     let parsed: URL;
     try {
       parsed = new URL(url);
@@ -51,22 +60,21 @@ app.post("/shorten", async (req, res) => {
       return res.status(400).json({ error: "Invalid URL" });
     }
 
-    // NEW: only allow http and https links
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return res.status(400).json({ error: "Only http and https URLs allowed" });
     }
 
-    // 2. NEW: work out the expiry time (or null = never expires)
     let expiresAt: Date | null = null;
     if (expiresInMinutes !== undefined) {
       const minutes = Number(expiresInMinutes);
       if (!Number.isFinite(minutes) || minutes <= 0) {
-        return res.status(400).json({ error: "expiresInMinutes must be a positive number" });
+        return res
+          .status(400)
+          .json({ error: "expiresInMinutes must be a positive number" });
       }
       expiresAt = new Date(Date.now() + minutes * 60 * 1000);
     }
 
-    // 3. NEW: custom alias path
     if (alias !== undefined) {
       if (!ALIAS_PATTERN.test(alias)) {
         return res.status(400).json({
@@ -84,7 +92,6 @@ app.post("/shorten", async (req, res) => {
         );
         return res.status(201).json({ short: `${BASE_URL}/${alias}` });
       } catch (err: any) {
-        // 23505 = Postgres code for "unique violation" (alias already taken)
         if (err.code === "23505") {
           return res.status(409).json({ error: "Alias already taken" });
         }
@@ -92,9 +99,7 @@ app.post("/shorten", async (req, res) => {
       }
     }
 
-    // 4. NEW: auto-generated code path (one INSERT instead of two steps)
     for (let attempt = 0; attempt < 3; attempt++) {
-      // Ask the database for the next unique id
       const idResult = await pool.query("SELECT nextval('urls_id_seq') AS id");
       const code = toBase62(Number(idResult.rows[0].id) + 1000000);
 
@@ -105,7 +110,6 @@ app.post("/shorten", async (req, res) => {
         );
         return res.status(201).json({ short: `${BASE_URL}/${code}` });
       } catch (err: any) {
-        // If someone already took this code as a custom alias, try again
         if (err.code !== "23505") throw err;
       }
     }
@@ -117,24 +121,67 @@ app.post("/shorten", async (req, res) => {
   }
 });
 
+// CHANGED: the redirect route now checks Redis first
 app.get("/:code", async (req, res) => {
+  const code = req.params.code;
+  const cacheKey = `url:${code}`; // Redis key, e.g. "url:my-google"
+
   try {
+    // STEP A: look in Redis first
+    let cached: string | null = null;
+    try {
+      cached = await redis.get(cacheKey);
+    } catch {
+      // If Redis fails, we do NOT fail the request. We fall back to the database.
+      console.error("Redis read failed, falling back to database");
+    }
+
+    // STEP B: cache hit
+    if (cached) {
+      const { longUrl, expiresAt } = JSON.parse(cached);
+      if (expiresAt && new Date(expiresAt) < new Date()) {
+        return res.status(410).send("This link has expired");
+      }
+      res.set("X-Cache", "HIT"); // header so we can SEE it working
+      return res.redirect(302, longUrl);
+    }
+
+    // STEP C: cache miss, ask PostgreSQL
     const { rows } = await pool.query(
       "SELECT long_url, expires_at FROM urls WHERE code = $1",
-      [req.params.code]
+      [code]
     );
 
     if (rows.length === 0) {
       return res.status(404).send("Not found");
     }
 
-    // NEW: if an expiry exists and it is in the past, the link is dead
-    const expiresAt = rows[0].expires_at;
+    const longUrl: string = rows[0].long_url;
+    const expiresAt: Date | null = rows[0].expires_at;
+
     if (expiresAt && new Date(expiresAt) < new Date()) {
       return res.status(410).send("This link has expired");
     }
 
-    res.redirect(302, rows[0].long_url);
+    // STEP D: save in Redis for next time.
+    // TTL = 1 hour, or less if the link expires sooner.
+    let ttl = CACHE_TTL_SECONDS;
+    if (expiresAt) {
+      const secondsLeft = Math.floor(
+        (new Date(expiresAt).getTime() - Date.now()) / 1000
+      );
+      ttl = Math.min(ttl, secondsLeft);
+    }
+    if (ttl > 0) {
+      try {
+        await redis.set(cacheKey, JSON.stringify({ longUrl, expiresAt }), "EX", ttl);
+      } catch {
+        console.error("Redis write failed, continuing without cache");
+      }
+    }
+
+    res.set("X-Cache", "MISS");
+    res.redirect(302, longUrl);
   } catch (err) {
     console.error(err);
     res.status(500).send("Internal server error");
