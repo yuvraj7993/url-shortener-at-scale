@@ -22,6 +22,8 @@ redis.on("error", (err) => console.error("Redis error:", err.message));
 
 // NEW: keep cached links for at most 1 hour
 const CACHE_TTL_SECONDS = 3600;
+// Set CACHE_ENABLED=false in .env to turn the cache off (for load testing)
+const CACHE_ENABLED = process.env.CACHE_ENABLED !== "false";
 
 const app = express();
 app.use(express.json());
@@ -128,9 +130,9 @@ app.get("/:code", async (req, res) => {
 
   try {
     // STEP A: look in Redis first
-    let cached: string | null = null;
+        let cached: string | null = null;
     try {
-      cached = await redis.get(cacheKey);
+      if (CACHE_ENABLED) cached = await redis.get(cacheKey);
     } catch {
       // If Redis fails, we do NOT fail the request. We fall back to the database.
       console.error("Redis read failed, falling back to database");
@@ -172,7 +174,7 @@ app.get("/:code", async (req, res) => {
       );
       ttl = Math.min(ttl, secondsLeft);
     }
-    if (ttl > 0) {
+       if (CACHE_ENABLED && ttl > 0) {
       try {
         await redis.set(cacheKey, JSON.stringify({ longUrl, expiresAt }), "EX", ttl);
       } catch {
