@@ -1,5 +1,5 @@
 import "dotenv/config";
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import { Pool } from "pg";
 import Redis from "ioredis";
 
@@ -24,6 +24,56 @@ redis.on("error", (err) => console.error("Redis error:", err.message));
 const CACHE_TTL_SECONDS = 3600;
 // Set CACHE_ENABLED=false in .env to turn the cache off (for load testing)
 const CACHE_ENABLED = process.env.CACHE_ENABLED !== "false";
+// ---------- Rate limiting settings (from .env) ----------
+const RATE_LIMIT_ENABLED = process.env.RATE_LIMIT_ENABLED !== "false";
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 10;
+const RATE_LIMIT_WINDOW_SECONDS =
+  Number(process.env.RATE_LIMIT_WINDOW_SECONDS) || 60;
+
+// ---------- Rate limiter middleware ----------
+async function rateLimit(req: Request, res: Response, next: NextFunction) {
+  // Switch: lets us turn the limiter off (for load tests)
+  if (!RATE_LIMIT_ENABLED) return next();
+
+  // One counter per client IP address
+  const key = `ratelimit:shorten:${req.ip}`;
+
+  try {
+    // Run 3 Redis commands together as one transaction:
+    //   1. INCR   add 1 to the counter (creates it at 1 if missing)
+    //   2. EXPIRE start the 60s timer, only if no timer exists yet ("NX")
+    //   3. TTL    read how many seconds are left on the timer
+    const results = await redis
+      .multi()
+      .incr(key)
+      .expire(key, RATE_LIMIT_WINDOW_SECONDS, "NX")
+      .ttl(key)
+      .exec();
+
+    const count = Number(results![0][1]); // requests so far in this window
+    const secondsLeft = Number(results![2][1]); // time until the counter resets
+
+    // Headers so clients can see their limit
+    res.set("X-RateLimit-Limit", String(RATE_LIMIT_MAX));
+    res.set(
+      "X-RateLimit-Remaining",
+      String(Math.max(0, RATE_LIMIT_MAX - count))
+    );
+
+    if (count > RATE_LIMIT_MAX) {
+      res.set("Retry-After", String(secondsLeft));
+      return res
+        .status(429)
+        .json({ error: "Too many requests. Please try again later." });
+    }
+
+    next(); // under the limit: carry on to the real route
+  } catch {
+    // If Redis is down, let the request through ("fail open")
+    console.error("Rate limiter failed (Redis down?), allowing request");
+    next();
+  }
+}
 
 const app = express();
 app.use(express.json());
@@ -51,7 +101,7 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-app.post("/shorten", async (req, res) => {
+app.post("/shorten", rateLimit, async (req, res) => {
   try {
     const { url, alias, expiresInMinutes } = req.body;
 
